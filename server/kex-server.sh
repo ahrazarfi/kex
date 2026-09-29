@@ -124,7 +124,7 @@ check_memory() {
     kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
     if [ "$kb" -lt 1900000 ]; then
         warn "This machine has only $((kb / 1024)) MB of RAM. The desktop uses roughly 300-500 MB while you're connected, which can slow down other services running here."
-        read -rp "Continue anyway? [y/N] " answer
+        read -rp "Continue anyway? [y/N] " answer || answer=""
         [[ "$answer" =~ ^[yY] ]] || die "Stopped. Nothing was installed."
     fi
 }
@@ -134,13 +134,30 @@ install_packages() {
     sudo apt-get update
     # Name a screen locker explicitly, or apt picks light-locker, which drags in lightdm (useless over RDP).
     local locker=xscreensaver
-    if apt-cache policy xfce4-screensaver 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+    if grep -q 'Candidate: [0-9]' <<<"$(apt-cache policy xfce4-screensaver 2>/dev/null)"; then
         locker=xfce4-screensaver
     fi
     local pkgs=(xfce4 xfce4-terminal "$locker" dbus-x11 xrdp xorgxrdp)
     [ "$FULL" = 1 ] && pkgs+=(xfce4-goodies)
+
+    # The package would start xrdp on all interfaces before we restrict it. Forbid just that start
+    # via policy-rc.d (unless the system already has its own policy, which we leave alone).
+    local policy_added=""
+    if [ ! -e /usr/sbin/policy-rc.d ]; then
+        # shellcheck disable=SC2016  # $1 belongs to the generated script
+        printf '#!/bin/sh\ncase "$1" in xrdp|xrdp.service) exit 101 ;; esac\nexit 0\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+        sudo chmod 755 /usr/sbin/policy-rc.d
+        policy_added=1
+        trap 'sudo rm -f /usr/sbin/policy-rc.d' EXIT
+    fi
+
     # NEEDRESTART_*: never let Ubuntu's needrestart restart unrelated services (e.g. Docker) on a live server.
     sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l apt-get install -y "${pkgs[@]}"
+
+    if [ -n "$policy_added" ]; then
+        sudo rm -f /usr/sbin/policy-rc.d
+        trap - EXIT
+    fi
 }
 
 # Every TCP socket owned by xrdp or xrdp-sesman, one "addr:port" per line.
@@ -151,7 +168,7 @@ xrdp_listeners() {
 wait_for_port() {
     local _
     for _ in $(seq 1 10); do
-        xrdp_listeners | grep -qE ":$PORT\$" && return 0
+        grep -qE ":$PORT\$" <<<"$(xrdp_listeners)" && return 0
         sleep 1
     done
     return 1
@@ -170,27 +187,29 @@ restart_and_verify() {
 
 configure_xrdp() {
     info "Restricting xrdp to 127.0.0.1:$PORT..."
-    sudo cp -n "$INI" "$INI.kex-orig"
-    sudo cp -n "$SESMAN" "$SESMAN.kex-orig"
+    [ -e "$INI.kex-orig" ] || sudo cp "$INI" "$INI.kex-orig"
+    [ -e "$SESMAN.kex-orig" ] || sudo cp "$SESMAN" "$SESMAN.kex-orig"
 
     sudo sed -i '/^\[Security\]/,/^\[/ s/^AllowRootLogin=.*/AllowRootLogin=false/' "$SESMAN"
 
-    # Older xrdp (e.g. 0.9.12 on Ubuntu 20.04) uses address=; newer uses port=tcp://ip:port.
-    sudo sed -i '/^\[Globals\]/,/^\[/{/^address=/d;s/^port=.*/port='"$PORT"'\naddress=127.0.0.1/}' "$INI"
-    if ! restart_and_verify; then
+    # Use the listen syntax this xrdp documents in its own config file, so it never starts with a
+    # setting it ignores: current versions (0.9.12+ on Ubuntu 20.04 and later) describe port=tcp://..., older ones use address=.
+    if sudo grep -q 'port=tcp://' "$INI"; then
         sudo sed -i '/^\[Globals\]/,/^\[/{/^address=/d;s|^port=.*|port=tcp://127.0.0.1:'"$PORT"'|}' "$INI"
-        if ! restart_and_verify; then
-            svc stop >/dev/null 2>&1 || true
-            printf 'xrdp listeners were:\n%s\n' "$(xrdp_listeners)" >&2
-            die "Couldn't confirm xrdp listens on localhost only, so it has been stopped. Nothing is exposed."
-        fi
+    else
+        sudo sed -i '/^\[Globals\]/,/^\[/{/^address=/d;s/^port=.*/port='"$PORT"'\naddress=127.0.0.1/}' "$INI"
+    fi
+    if ! restart_and_verify; then
+        svc stop >/dev/null 2>&1 || true
+        printf 'xrdp listeners were:\n%s\n' "$(xrdp_listeners)" >&2
+        die "Couldn't confirm xrdp listens on localhost only, so it has been stopped. Nothing is exposed."
     fi
     info "Verified: xrdp is only reachable from this machine (and through the SSH tunnel)."
 }
 
 configure_session() {
     local xs="$HOME/.xsession"
-    if [ ! -e "$xs" ] || head -n1 "$xs" | grep -qxF "$XSESSION_MARKER"; then
+    if [ ! -e "$xs" ] || [ "$(head -n1 "$xs")" = "$XSESSION_MARKER" ]; then
         # WAYLAND_DISPLAY leaking in from WSLg would send app windows to Windows instead of the RDP session.
         printf '%s\nunset WAYLAND_DISPLAY\nexec xfce4-session\n' "$XSESSION_MARKER" > "$xs"
     else
@@ -211,7 +230,7 @@ set_password() {
     local status answer pw
     status=$(sudo passwd -S "$USER" | awk '{ print $2 }')
     if [ "$status" = P ]; then
-        read -rp "Account '$USER' already has a password. Replace it with a new random one? [y/N] " answer
+        read -rp "Account '$USER' already has a password. Replace it with a new random one? [y/N] " answer || answer=""
         case "$answer" in
             [yY]*) ;;
             *) info "Keeping your existing password for desktop login."; return ;;
@@ -237,8 +256,8 @@ EOF
 }
 
 check_auto_updates() {
-    if ! dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q 'install ok installed' \
-        || ! apt-config dump 2>/dev/null | grep -q 'APT::Periodic::Unattended-Upgrade "1"'; then
+    if ! grep -q 'install ok installed' <<<"$(dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null)" \
+        || ! grep -q 'APT::Periodic::Unattended-Upgrade "1"' <<<"$(apt-config dump 2>/dev/null)"; then
         warn "Automatic security updates are off. Enable them so xrdp and the desktop get patched:"
         warn "  sudo apt-get install -y unattended-upgrades && sudo dpkg-reconfigure -plow unattended-upgrades"
     fi
@@ -246,7 +265,7 @@ check_auto_updates() {
 
 fix_wslg_x11_dir() {
     # WSLg mounts /tmp/.X11-unix read-only, which stops xrdp's X server from creating its socket.
-    if findmnt -no OPTIONS /tmp/.X11-unix 2>/dev/null | grep -qE '(^|,)ro(,|$)'; then
+    if grep -qE '(^|,)ro(,|$)' <<<"$(findmnt -no OPTIONS /tmp/.X11-unix 2>/dev/null)"; then
         sudo mount -o remount,rw /tmp/.X11-unix
         sudo chmod 1777 /tmp/.X11-unix
     fi
@@ -282,7 +301,7 @@ do_install() {
 do_start() {
     [ -f "$INI" ] || die "xrdp isn't installed. Run 'kex setup' first."
     fix_wslg_x11_dir
-    if xrdp_listeners | grep -qE ":$PORT\$"; then
+    if grep -qE ":$PORT\$" <<<"$(xrdp_listeners)"; then
         only_loopback || die "xrdp is listening on a non-local address. Run 'kex setup' again to fix its config."
         info "xrdp already running."
         return
@@ -303,11 +322,11 @@ do_uninstall() {
     svc stop >/dev/null 2>&1 || true
     sudo rm -f "$INI.kex-orig" "$SESMAN.kex-orig"
     sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l apt-get purge -y xrdp xorgxrdp
-    if [ -f "$HOME/.xsession" ] && head -n1 "$HOME/.xsession" | grep -qxF "$XSESSION_MARKER"; then
+    if [ -f "$HOME/.xsession" ] && [ "$(head -n1 "$HOME/.xsession")" = "$XSESSION_MARKER" ]; then
         rm -f "$HOME/.xsession"
     fi
     if [ -f "$STATE_DIR/password-set-by-kex" ]; then
-        read -rp "Lock the password kex set for '$USER' (back to SSH-key-only login)? [Y/n] " answer
+        read -rp "Lock the password kex set for '$USER' (back to SSH-key-only login)? [Y/n] " answer || answer=""
         case "$answer" in
             [nN]*) ;;
             *) sudo passwd -l "$USER" >/dev/null && info "Password locked." ;;

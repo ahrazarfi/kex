@@ -168,17 +168,17 @@ open_rdp() {
 prompt() {
     local __var="$1" __msg="$2" __def="${3:-}" __ans
     if [ -n "$__def" ]; then
-        read -rp "$__msg [$__def]: " __ans
+        read -rp "$__msg [$__def]: " __ans || __ans=""
         __ans="${__ans:-$__def}"
     else
-        read -rp "$__msg: " __ans
+        read -rp "$__msg: " __ans || __ans=""
     fi
     printf -v "$__var" '%s' "$__ans"
 }
 
 yes_no() {
     local ans
-    read -rp "$1 [y/N] " ans
+    read -rp "$1 [y/N] " ans || ans=""
     [[ "$ans" =~ ^[yY] ]]
 }
 
@@ -228,7 +228,8 @@ cmd_setup() {
     ssh_opts
 
     info "Checking SSH access to $host (confirm the host fingerprint if asked)..."
-    ssh "${SSH_OPTS[@]}" -o ConnectTimeout=15 -- "$host" true \
+    # -n: without it, this ssh swallows any answers already typed/piped for later prompts.
+    ssh "${SSH_OPTS[@]}" -n -o ConnectTimeout=15 -- "$host" true \
         || die "couldn't SSH to $host. Fix SSH access first (key, username, security group allowing port 22)."
 
     info "Setting up the desktop on $host (you may be asked for your sudo password there)..."
