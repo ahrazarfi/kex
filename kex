@@ -1,0 +1,364 @@
+#!/bin/bash
+# kex: one-command XFCE desktop for WSL2 or a cloud VM (over an SSH tunnel).
+set -euo pipefail
+
+KEX_VERSION=0.1.0
+
+resolve_self() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -L "$src" ]; do
+        dir=$(cd -P "$(dirname "$src")" && pwd)
+        src=$(readlink "$src")
+        [[ "$src" = /* ]] || src="$dir/$src"
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+KEX_HOME=$(resolve_self)
+SERVER_SCRIPT="$KEX_HOME/server/kex-server.sh"
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kex"
+PROFILE_DIR="$CONF_DIR/profiles"
+RUN_DIR="$CONF_DIR/run"
+WSL_PORT=3390
+
+die() { printf 'kex: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+
+is_wsl() {
+    # Not /proc/version: Docker Desktop containers run on the WSL kernel too.
+    [ -d /run/WSL ] || [ -n "${WSL_DISTRO_NAME:-}" ] || compgen -G '/proc/sys/fs/binfmt_misc/WSLInterop*' >/dev/null
+}
+
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]; }
+valid_host() { [[ "$1" =~ ^([A-Za-z0-9._-]+@)?[A-Za-z0-9._:-]+$ && "$1" != -* ]]; }
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1024 ] && [ "$1" -le 65535 ]; }
+
+ensure_dirs() {
+    mkdir -p "$PROFILE_DIR" "$RUN_DIR"
+    chmod 700 "$CONF_DIR" "$RUN_DIR"
+}
+
+# Profiles are plain key=value files. They're parsed, never sourced, so they can't run code.
+profile_get() {
+    local file="$1" key="$2" line
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in "$key="*) printf '%s' "${line#*=}"; return 0 ;; esac
+    done < "$file"
+    return 1
+}
+
+P_NAME="" P_MODE="" P_HOST="" P_KEY="" P_RPORT="" P_LPORT=""
+
+load_profile() {
+    local f="$PROFILE_DIR/$1"
+    valid_name "$1" || die "invalid profile name '$1'"
+    [ -f "$f" ] || die "no profile named '$1'. See 'kex list'."
+    P_NAME="$1"
+    P_MODE=$(profile_get "$f" mode || true)
+    P_HOST=$(profile_get "$f" host || true)
+    P_KEY=$(profile_get "$f" key || true)
+    P_RPORT=$(profile_get "$f" remote_port || true)
+    P_LPORT=$(profile_get "$f" local_port || true)
+    case "$P_MODE" in
+        wsl) valid_port "$P_LPORT" || die "profile '$1' is corrupt" ;;
+        vm)
+            if ! { valid_host "$P_HOST" && valid_port "$P_RPORT" && valid_port "$P_LPORT"; }; then
+                die "profile '$1' is corrupt; run 'kex setup' again"
+            fi
+            [ -z "$P_KEY" ] || [ -r "$P_KEY" ] || die "SSH key '$P_KEY' for profile '$1' is missing"
+            ;;
+        *) die "profile '$1' is corrupt" ;;
+    esac
+}
+
+save_profile() {
+    local f="$PROFILE_DIR/$1" tmp
+    tmp=$(mktemp "$PROFILE_DIR/.tmp.XXXXXX")
+    {
+        echo "mode=$2"
+        [ -n "$3" ] && echo "host=$3"
+        [ -n "$4" ] && echo "key=$4"
+        [ -n "$5" ] && echo "remote_port=$5"
+        echo "local_port=$6"
+    } > "$tmp"
+    mv "$tmp" "$f"
+}
+
+profile_names() {
+    local f
+    for f in "$PROFILE_DIR"/*; do
+        [ -f "$f" ] && basename "$f"
+    done
+    return 0
+}
+
+# Sets PICKED. Returns 1 if no profiles exist; exits if the choice is ambiguous.
+pick_profile() {
+    PICKED="${1:-}"
+    [ -n "$PICKED" ] && return 0
+    local names=()
+    while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(profile_names)
+    case "${#names[@]}" in
+        0) return 1 ;;
+        1) PICKED="${names[0]}" ;;
+        *) die "you have several profiles (${names[*]}); say which: kex ${CMD:-start} <name>" ;;
+    esac
+}
+
+ssh_opts() {
+    SSH_OPTS=(-o ServerAliveInterval=30 -o ServerAliveCountMax=3)
+    [ -n "$P_KEY" ] && SSH_OPTS+=(-i "$P_KEY" -o IdentitiesOnly=yes)
+    return 0
+}
+
+check_key_perms() {
+    local key="$1" mode
+    mode=$(stat -c '%a' "$key" 2>/dev/null || stat -f '%Lp' "$key")
+    if [ "$((8#$mode & 077))" -ne 0 ]; then
+        die "SSH refuses keys other users can read ($key is mode $mode). Copy it somewhere private:
+  mkdir -p ~/.ssh && cp '$key' ~/.ssh/ && chmod 600 ~/.ssh/$(basename "$key")
+then use ~/.ssh/$(basename "$key") as the key path."
+    fi
+}
+
+port_in_use() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+free_local_port() {
+    local p used
+    used=$(for n in $(profile_names); do profile_get "$PROFILE_DIR/$n" local_port || true; echo; done)
+    for p in $(seq 3391 3499); do
+        grep -qx "$p" <<<"$used" && continue
+        port_in_use "$p" && continue
+        echo "$p"
+        return
+    done
+    die "no free local port between 3391 and 3499"
+}
+
+run_remote_server() {
+    local args="$1" b64 remote
+    b64=$(base64 < "$SERVER_SCRIPT" | tr -d '\n')
+    # mktemp gives a private, unpredictable file; the base64 alphabet needs no quoting.
+    remote="f=\$(mktemp) && echo $b64 | base64 -d > \$f && bash \$f $args; r=\$?; rm -f \$f; exit \$r"
+    ssh "${SSH_OPTS[@]}" -t -- "$P_HOST" "$remote"
+}
+
+open_rdp() {
+    local target="127.0.0.1:$1" mstsc
+    if is_wsl; then
+        mstsc=$(command -v mstsc.exe || echo /mnt/c/Windows/System32/mstsc.exe)
+        (cd /mnt/c 2>/dev/null; "$mstsc" "/v:$target" >/dev/null 2>&1 &)
+    elif command -v xfreerdp3 >/dev/null; then
+        (xfreerdp3 "/v:$target" /dynamic-resolution >/dev/null 2>&1 &)
+    elif command -v xfreerdp >/dev/null; then
+        (xfreerdp "/v:$target" /dynamic-resolution >/dev/null 2>&1 &)
+    elif command -v remmina >/dev/null; then
+        (remmina -c "rdp://$target" >/dev/null 2>&1 &)
+    elif [ "$(uname)" = Darwin ]; then
+        open "rdp://full%20address=s:$target"
+    else
+        info "No RDP client found. Install FreeRDP (e.g. 'sudo apt install freerdp2-x11') or connect any RDP client to $target."
+        return
+    fi
+    info "Opening Remote Desktop -> $target"
+}
+
+prompt() {
+    local __var="$1" __msg="$2" __def="${3:-}" __ans
+    if [ -n "$__def" ]; then
+        read -rp "$__msg [$__def]: " __ans
+        __ans="${__ans:-$__def}"
+    else
+        read -rp "$__msg: " __ans
+    fi
+    printf -v "$__var" '%s' "$__ans"
+}
+
+yes_no() {
+    local ans
+    read -rp "$1 [y/N] " ans
+    [[ "$ans" =~ ^[yY] ]]
+}
+
+cmd_setup() {
+    ensure_dirs
+    [ -r "$SERVER_SCRIPT" ] || die "missing $SERVER_SCRIPT; reinstall kex"
+    local choice="2"
+    if is_wsl; then
+        echo "Where should the desktop run?"
+        echo "  1) Here, in this WSL2 distro"
+        echo "  2) On a cloud VM (EC2, Google Cloud, Oracle, ...) over SSH"
+        prompt choice "Choose 1 or 2" "1"
+    fi
+
+    local full=""
+    yes_no "Also install extra XFCE apps (xfce4-goodies, bigger download)?" && full=1
+
+    if [ "$choice" = 1 ]; then
+        bash "$SERVER_SCRIPT" --mode wsl --port "$WSL_PORT" --install ${full:+--full}
+        save_profile wsl wsl "" "" "" "$WSL_PORT"
+        info ""
+        info "Done. Start the desktop with: kex start wsl  (log in with your WSL username and password)"
+        return
+    fi
+    [ "$choice" = 2 ] || die "please choose 1 or 2"
+
+    local name host key rport lport
+    prompt host "SSH login for the VM (e.g. ubuntu@203.0.113.10 or a Host from ~/.ssh/config)"
+    valid_host "$host" || die "'$host' doesn't look like user@host"
+    prompt key "Path to the SSH private key (.pem) - leave empty to use your SSH agent/config" ""
+    if [ -n "$key" ]; then
+        key="${key/#\~/$HOME}"
+        [ -r "$key" ] || die "can't read $key"
+        key=$(cd "$(dirname "$key")" && pwd)/$(basename "$key")
+        [[ "$key" != *$'\n'* ]] || die "invalid key path"
+        check_key_perms "$key"
+    fi
+    local default_name="${host#*@}"
+    default_name=$(printf '%s' "$default_name" | tr 'A-Z.:' 'a-z--' | tr -cd 'a-z0-9_-' | cut -c1-32)
+    prompt name "Name for this profile" "${default_name:-vm}"
+    valid_name "$name" || die "profile names use lowercase letters, digits, - and _"
+    prompt rport "xrdp port on the VM" "3389"
+    valid_port "$rport" || die "invalid port"
+    lport=$(free_local_port)
+
+    P_NAME="$name" P_HOST="$host" P_KEY="$key" P_RPORT="$rport" P_LPORT="$lport"
+    ssh_opts
+
+    info "Checking SSH access to $host (confirm the host fingerprint if asked)..."
+    ssh "${SSH_OPTS[@]}" -o ConnectTimeout=15 -- "$host" true \
+        || die "couldn't SSH to $host. Fix SSH access first (key, username, security group allowing port 22)."
+
+    info "Setting up the desktop on $host (you may be asked for your sudo password there)..."
+    run_remote_server "--mode vm --port $rport --install${full:+ --full}" || die "setup on the VM failed (see above)"
+
+    save_profile "$name" vm "$host" "$key" "$rport" "$lport"
+    info ""
+    info "Done. Connect with: kex start $name"
+    info "Only SSH (port 22) needs to be open in the VM's firewall. Do NOT open port $rport."
+}
+
+tunnel_up() {
+    ssh -S "$RUN_DIR/$P_NAME.sock" -O check -- "$P_HOST" >/dev/null 2>&1
+}
+
+cmd_start() {
+    local name
+    pick_profile "${1:-}" || { info "No desktop configured yet - starting setup."; cmd_setup; return; }
+    name="$PICKED"
+    load_profile "$name"
+    ensure_dirs
+
+    if [ "$P_MODE" = wsl ]; then
+        is_wsl || die "profile '$name' is for WSL, but this isn't WSL"
+        bash "$SERVER_SCRIPT" --mode wsl --port "$P_LPORT" --start
+    else
+        ssh_opts
+        if tunnel_up; then
+            info "Tunnel to $P_HOST already open."
+        else
+            rm -f "$RUN_DIR/$name.sock"
+            port_in_use "$P_LPORT" && die "local port $P_LPORT is already in use by another program"
+            info "Opening SSH tunnel to $P_HOST..."
+            ssh "${SSH_OPTS[@]}" -f -N -M -S "$RUN_DIR/$name.sock" -o ExitOnForwardFailure=yes \
+                -L "127.0.0.1:$P_LPORT:127.0.0.1:$P_RPORT" -- "$P_HOST" \
+                || die "couldn't open the SSH tunnel"
+        fi
+    fi
+    open_rdp "$P_LPORT"
+}
+
+cmd_stop() {
+    local name
+    pick_profile "${1:-}" || die "nothing configured"
+    name="$PICKED"
+    load_profile "$name"
+    if [ "$P_MODE" = wsl ]; then
+        bash "$SERVER_SCRIPT" --mode wsl --stop
+    else
+        ssh -S "$RUN_DIR/$name.sock" -O exit -- "$P_HOST" >/dev/null 2>&1 || true
+        rm -f "$RUN_DIR/$name.sock"
+        info "Tunnel to $P_HOST closed. (The desktop keeps running on the VM, reachable only through SSH.)"
+    fi
+}
+
+status_one() {
+    load_profile "$1"
+    if [ "$P_MODE" = wsl ]; then
+        if pgrep -x xrdp >/dev/null; then
+            info "$1  [wsl]  running   -> 127.0.0.1:$P_LPORT"
+        else
+            info "$1  [wsl]  stopped"
+        fi
+    elif tunnel_up; then
+        info "$1  [vm $P_HOST]  connected -> 127.0.0.1:$P_LPORT"
+    else
+        info "$1  [vm $P_HOST]  not connected"
+    fi
+}
+
+cmd_status() {
+    if [ -n "${1:-}" ]; then
+        status_one "$1"
+        return
+    fi
+    local n any=""
+    for n in $(profile_names); do status_one "$n"; any=1; done
+    [ -n "$any" ] || info "No desktops configured. Run 'kex setup'."
+}
+
+cmd_remove() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: kex remove <name>"
+    load_profile "$name"
+    yes_no "Uninstall xrdp from '$name' and delete the profile?" || exit 0
+    if [ "$P_MODE" = wsl ]; then
+        bash "$SERVER_SCRIPT" --mode wsl --uninstall
+    else
+        cmd_stop "$name"
+        ssh_opts
+        run_remote_server "--mode vm --uninstall" || die "uninstall on the VM failed; profile kept"
+    fi
+    rm -f "$PROFILE_DIR/$name"
+    info "Profile '$name' removed."
+}
+
+usage() {
+    cat <<EOF
+kex $KEX_VERSION - desktop for WSL2 or a cloud VM
+
+  kex setup            set up a desktop (asks: WSL2 or cloud VM)
+  kex [start] [name]   start the desktop and open Remote Desktop
+  kex stop [name]      stop it (alias: kexit)
+  kex status [name]    show what's running (alias: kstatus)
+  kex list             list profiles
+  kex remove <name>    uninstall from that machine and delete the profile
+EOF
+}
+
+case "$(basename "$0")" in
+    kexit) CMD=stop ;;
+    kstatus) CMD=status ;;
+    *) CMD="${1:-start}"; [ $# -gt 0 ] && shift ;;
+esac
+
+case "$CMD" in
+    setup) cmd_setup ;;
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    status) cmd_status "$@" ;;
+    list) profile_names ;;
+    remove|uninstall) cmd_remove "$@" ;;
+    version|--version) echo "kex $KEX_VERSION" ;;
+    help|-h|--help) usage ;;
+    *)
+        if valid_name "$CMD" && [ -f "$PROFILE_DIR/$CMD" ]; then
+            cmd_start "$CMD"
+        else
+            usage
+            exit 2
+        fi
+        ;;
+esac
