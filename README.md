@@ -185,3 +185,7 @@ tests/e2e/              end-to-end tests (Docker)
 ```
 
 Issues and pull requests are welcome.
+
+## License
+
+[MIT](LICENSE)
